@@ -9,14 +9,6 @@ import sys
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 
-sys.tracebacklimit = 0
-
-def get_input(inp):
-    if sys.version_info >= (3, 0):
-        return input(inp)
-    else:
-        return raw_input(inp)
-
 class ServerError(Exception):
     pass
 
@@ -33,78 +25,51 @@ class Uploader(object):
     DEVICE_NAME = 'python 3 uploader script'
     USER_AGENT = 'ibroadcast-uploader/' + VERSION
 
-
     def __init__(self, login_token, directory, no_cache, verbose, silent, skip_confirmation, parallel_uploads):
-        if verbose:
-            sys.tracebacklimit = 1000
-
         self.login_token = login_token
-
-        if directory:
-            os.chdir(directory)
-
-        self.be_verbose = verbose
-        self.be_silent = silent
+        self.directory = directory
         self.no_cache = no_cache
+        self.verbose = verbose
+        self.silent = silent
         self.skip_confirmation = skip_confirmation
+        self.parallel_uploads = parallel_uploads
 
-        # Initialise our variables that each function will set.
-        self.user_id = None
-        self.token = None
         self.supported = None
-        self.files = None
-        self.skipped_files = None
-        self.failed_files = None
-        self.md5_int_path = None
-        self.md5_int = None
-        self.md5_ext = None
+        self.files = []
+        self.skipped_files = []
+        self.failed_files = []
+        self.md5_int = {}
+        self.md5_ext = {}
+
+        if self.verbose:
+            sys.tracebacklimit = 1000
 
     def process(self):
         try:
             self.login()
-        except ValueError as e:
-            print('Login failed: %s' % e)
-            return
-
-        try:
             self.get_supported_types()
-        except ValueError as e:
-            print('Unable to fetch account info: %s' % e)
+        except (ServerError, ValueError) as e:
+            print(e)
             return
 
-        if not self.be_silent:
+        if not self.silent:
             print('Building file list...')
-
         self.load_files()
 
         if self.confirm():
+            self.check_md5()
             self.prepare_upload()
 
-
-    def login(self, login_token=None,):
-        """
-        Login to iBroadcast with the given login_token
-
-        Raises:
-            ValueError on invalid login
-
-        """
-        # Default to passed in values, but fallback to initial data.
-        login_token = login_token or self.login_token
-
-        if self.be_verbose:
-            print('Logging in...')
-
-        # Build a request object.
+    def login(self):
         post_data = json.dumps({
-            'mode' : 'login_token',
-            'login_token': login_token,
+            'mode': 'login_token',
+            'login_token': self.login_token,
             'app_id': 1007,
             'type': 'account',
             'version': self.VERSION,
             'client': self.CLIENT,
-            'device_name' : self.DEVICE_NAME,
-            'user_agent' : self.USER_AGENT
+            'device_name': self.DEVICE_NAME,
+            'user_agent': self.USER_AGENT
         })
         response = requests.post(
             "https://api.ibroadcast.com/s/JSON/",
@@ -113,41 +78,29 @@ class Uploader(object):
         )
 
         if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
+            raise ServerError('Server returned bad status:', response.status_code)
 
         jsoned = response.json()
 
         if 'user' not in jsoned:
-            raise ValueError(jsoned.message)
+            raise ValueError(jsoned.get('message', 'Login failed'))
 
-        if self.be_verbose:
-            print('Login successful - user_id: ', jsoned['user']['id'])
+        if self.verbose:
+            print('Login successful - user_id:', jsoned['user']['id'])
 
         self.user_id = jsoned['user']['id']
         self.token = jsoned['user']['token']
 
     def get_supported_types(self):
-        """
-        Get supported file types
-
-        Raises:
-            ValueError on invalid login
-
-        """
-        if self.be_verbose:
-            print('Fetching account info...')
-
-        # Build a request object.
         post_data = json.dumps({
-            'mode' : 'status',
+            'mode': 'status',
             'user_id': self.user_id,
             'token': self.token,
             'supported_types': 1,
             'version': self.VERSION,
             'client': self.CLIENT,
-            'device_name' : self.DEVICE_NAME,
-            'user_agent' : self.USER_AGENT
+            'device_name': self.DEVICE_NAME,
+            'user_agent': self.USER_AGENT
         })
         response = requests.post(
             "https://api.ibroadcast.com/s/JSON/",
@@ -156,116 +109,67 @@ class Uploader(object):
         )
 
         if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
+            raise ServerError('Server returned bad status:', response.status_code)
 
         jsoned = response.json()
 
         if 'user' not in jsoned:
-            raise ValueError(jsoned.message)
+            raise ValueError(jsoned.get('message', 'Unable to fetch account info'))
 
-        if self.be_verbose:
+        if self.verbose:
             print('Account info fetched')
 
-        self.supported = []
-        self.files = []
-        self.skipped_files = []
-        self.failed_files = []
-
-        for filetype in jsoned['supported']:
-             self.supported.append(filetype['extension'])
+        self.supported = [filetype['extension'] for filetype in jsoned.get('supported', [])]
 
     def load_files(self, directory=None):
-        """
-        Load all files in the directory that match the supported extension list.
-
-        directory defaults to present working directory.
-
-        raises:
-            ValueError if supported is not yet set.
-        """
         if self.supported is None:
             raise ValueError('Supported not yet set - have you logged in yet?')
 
         if not directory:
-            directory = os.getcwd()
+            directory = self.directory or os.getcwd()
 
-        for full_filename in glob.glob(os.path.join(glob.escape(directory), '*')):
+        for full_filename in glob.glob(os.path.join(directory, '*')):
             filename = os.path.basename(full_filename)
-            # Skip hidden files.
             if filename.startswith('.'):
                 continue
 
-            # Make sure it's a supported extension.
             dummy, ext = os.path.splitext(full_filename)
             if ext in self.supported:
                 self.files.append(full_filename)
 
-            # Recurse into subdirectories.
-            # XXX Symlinks may cause... issues.
             if os.path.isdir(full_filename):
                 self.load_files(full_filename)
 
     def confirm(self):
-        """
-        Presents a dialog for the user to either list all files, or just upload.
-        """
         if self.skip_confirmation:
             return True
         else:
             print("Found %s files.  Press 'L' to list, or 'U' to start the " \
                   "upload." % len(self.files))
-            response = get_input('--> ')
+            response = self.get_input('--> ')
 
             print()
             if response == 'L'.upper():
                 print('Listing found, supported files')
                 for filename in sorted(self.files):
-                    print(' - ', filename)
+                    print(' -', filename)
                 print()
                 print("Press 'U' to start the upload if this looks reasonable.")
-                response = get_input('--> ')
+                response = self.get_input('--> ')
             if response == 'U'.upper():
-                if self.be_verbose:
+                if self.verbose:
                     print('Starting upload.')
                 return True
 
-            if self.be_verbose:
+            if self.verbose:
                 print('Aborting')
             return False
 
-    def __load_md5_int(self):
-        """
-        Load internal md5 database to not calculate everything from scratch
-        """
-        self.md5_int_path = os.getenv('HOME') + '/.ibroadcast_md5s'
-
-        if os.path.exists(self.md5_int_path):
-            with open(self.md5_int_path) as json_file:
-                self.md5_int = json.load(json_file)
+    def get_input(self, inp):
+        if sys.version_info >= (3, 0):
+            return input(inp)
         else:
-            self.md5_int = {}
-
-    def __load_md5_ext(self):
-        """
-        Reach out to iBroadcast and get an md5.
-        """
-        post_data = "user_id=%s&token=%s" % (self.user_id, self.token)
-
-        # Send our request.
-        response = requests.post(
-            "https://upload.ibroadcast.com",
-            data=post_data,
-            headers={'Content-Type': 'application/x-www-form-urlencoded'}
-        )
-
-        if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                             response.status_code)
-
-        jsoned = response.json()
-
-        self.md5_ext = jsoned['md5']
+            return raw_input(inp)
 
     def calcmd5(self, filePath="."):
         with open(filePath, 'rb') as fh:
@@ -282,95 +186,105 @@ class Uploader(object):
         self.__load_md5_ext()
 
         print_filename_again = True
-        current_path=''
+        current_path = ''
         file_list = self.files[:]
-        if not self.be_silent and not self.be_verbose:
-            file_list = self.progressbar(self.files[:], "Calculating MD5 hashes: ", 60)
+
+        if not self.verbose and not self.silent:
+            file_list = self.progressbar(self.files[:], "Calculating MD5 hashes:", 60)
 
         for filename in file_list:
             file_base_name = ' "' + os.path.basename(filename) + '"'
-            if not self.be_silent and self.be_verbose:
+            if not self.silent and self.verbose:
                 if os.path.dirname(filename) != current_path:
                     current_path = os.path.dirname(filename)
                     print('\nChecking directory %s...' % current_path)
 
-            # Get an md5 of the file contents and compare it to whats up
-            # there already
             if (not self.no_cache) and filename in self.md5_int:
                 file_md5 = self.md5_int[filename]
             else:
-                # We don't want to print the filename later
-                # when telling the user it has been skipped,
-                # because it's being printed here already
                 print_filename_again = False
-                if not self.be_silent and self.be_verbose:
-                    print('Calculating MD5 for file%s... ' % file_base_name, end='')
+                if not self.silent and self.verbose:
+                    print('Calculating MD5 for file%s...' % file_base_name, end='')
                 file_md5 = self.calcmd5(filename)
                 self.md5_int[filename] = file_md5
 
             if file_md5 in self.md5_ext:
                 self.skipped_files.append(filename)
-                if not self.be_silent and self.be_verbose:
+                if not self.silent and self.verbose:
                     if not print_filename_again:
                         file_base_name = ""
                     print('Skipping%s, already uploaded.' % file_base_name)
-                # Removing the files is faster than later comparing
-                # which files are present in self.skipped_files
                 self.files.remove(filename)
-            elif not self.be_silent and self.be_verbose:
-                # Add a new line if the file has not been skipped and is not
-                # cached, because the last print doesn't include an end line
+            elif not self.silent and self.verbose:
                 if not print_filename_again:
                     print()
                     continue
                 print('The MD5 for%s is cached, but the file has not been uploaded yet' % file_base_name)
             print_filename_again = True
 
+        self.save_md5_int()
+
+    def save_md5_int(self):
         with open(self.md5_int_path, 'w') as fp:
-            json.dump(self.md5_int, fp, indent = 2)
+            json.dump(self.md5_int, fp, indent=2)
+
+    def __load_md5_int(self):
+        self.md5_int_path = os.path.expanduser('~') + '/.ibroadcast_md5s'
+
+        if os.path.exists(self.md5_int_path):
+            with open(self.md5_int_path) as json_file:
+                self.md5_int = json.load(json_file)
+
+    def __load_md5_ext(self):
+        post_data = "user_id=%s&token=%s" % (self.user_id, self.token)
+        response = requests.post(
+            "https://upload.ibroadcast.com",
+            data=post_data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+
+        if not response.ok:
+            raise ServerError('Server returned bad status:', response.status_code)
+
+        jsoned = response.json()
+        self.md5_ext = jsoned['md5']
 
     def progressbar(self, it, prefix="", size=60, out=sys.stdout):
         count = len(it)
         def show(j):
             x = int(size*j/count)
             print("{}[{}{}] {}/{}".format(prefix, "#"*x, "."*(size-x), j, count),
-                end='\r', file=out, flush=True)
-        if (not self.be_verbose) and (not self.be_silent):
+                  end='\r', file=out, flush=True)
+        if not self.verbose and not self.silent:
             show(0)
         for i, item in enumerate(it):
             yield item
-            if (not self.be_verbose) and (not self.be_silent):
+            if not self.verbose and not self.silent:
                 show(i+1)
-        if (not self.be_verbose) and (not self.be_silent):
+        if not self.verbose and not self.silent:
             print("\n", flush=True, file=out)
 
     def prepare_upload(self):
-        threads = args.parallel_uploads
-        if (threads == 0):
+        threads = self.parallel_uploads
+        if threads == 0:
             threads = 1
 
         total_files = len(self.files)
-        # Remove already uploaded files from the list of files
-        self.check_md5()
         not_skipped_files = len(self.files)
 
         if not_skipped_files > 0:
             with ThreadPoolExecutor(max_workers=threads) as exe:
                 for i in range(not_skipped_files):
-                    exe.submit(self.upload,self.files[i])
-                # Wait for all tasks to finish before continuing
+                    exe.submit(self.upload, self.files[i])
                 exe.shutdown(wait=True)
 
         skipped = len(self.skipped_files)
         failed = len(self.failed_files)
-        uploaded = max(total_files-skipped-failed, 0)
-        print('Uploaded/Skipped/Failed/Total: %s/%s/%s/%s.' % (uploaded,skipped,failed,total_files))
+        uploaded = max(total_files - skipped - failed, 0)
+        print('Uploaded/Skipped/Failed/Total: %s/%s/%s/%s.' % (uploaded, skipped, failed, total_files))
 
     def upload(self, filename):
-        """
-        Go and perform an upload of any files that haven't yet been uploaded
-        """
-        if not self.be_silent:
+        if not self.silent:
             print('Uploading:', filename)
 
         upload_file = open(filename, 'rb')
@@ -382,7 +296,7 @@ class Uploader(object):
         post_data = {
             'user_id': self.user_id,
             'token': self.token,
-            'file_path' : filename,
+            'file_path': filename,
             'method': self.CLIENT,
         }
 
@@ -395,8 +309,7 @@ class Uploader(object):
         upload_file.close()
 
         if not response.ok:
-            raise ServerError('Server returned bad status: ',
-                response.status_code)
+            raise ServerError('Server returned bad status:', response.status_code)
         jsoned = response.json()
         result = jsoned['result']
 
@@ -416,6 +329,6 @@ if __name__ == '__main__':
     parser.add_argument('-y', '--skip-confirmation', action='store_true', help='Skip confirmation dialogue')
 
     args = parser.parse_args()
-    uploader = Uploader(args.login_token,args.directory,args.no_cache,args.verbose,args.silent,args.skip_confirmation,args.parallel_uploads)
+    uploader = Uploader(args.login_token, args.directory, args.no_cache, args.verbose, args.silent, args.skip_confirmation, args.parallel_uploads)
 
     uploader.process()
