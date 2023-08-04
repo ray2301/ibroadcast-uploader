@@ -6,3 +6,5 @@ Based on the original Python script from https://project.ibroadcast.com
  - added progress bar
  - added local MD5 cache to skip hash recalculation every time
  - added command line arguments (directory, confirmation skip, parallel uploads, verbose and silent modes)
+
+04.08.2023. - added some changes 'cause it didn't work for me.
